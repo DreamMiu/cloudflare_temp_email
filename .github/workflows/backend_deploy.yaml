@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # 确保能获取到完整的 git 历史，用于 patch 检查
 
       - name: Install Node.js
         uses: actions/setup-node@v6
@@ -30,54 +32,148 @@ jobs:
           version: 10
           run_install: false
 
+      # 添加 pnpm 缓存加速
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        name: Setup pnpm cache
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
       - name: Deploy Backend for ${{ github.ref_name }}
         run: |
-          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
-          export use_worker_assets_with_telegram=${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
+          # 导出变量
+          export use_worker_assets="${{ secrets.USE_WORKER_ASSETS }}"
+          export use_worker_assets_with_telegram="${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}"
+          export debug_mode="${{ secrets.DEBUG_MODE }}"
+          export use_mail_wasm_parser="${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}"
           
+          # 前端构建（如果需要）
           if [ -n "$use_worker_assets" ]; then
+            echo "📦 Building frontend assets..."
             cd frontend/
+            
+            # 安装依赖
             pnpm install --no-frozen-lockfile
+            
             if [ -n "$use_worker_assets_with_telegram" ]; then
-              echo "Building with telegram pages"
-              pnpm build:telegram:pages
+              echo "Building with Telegram pages"
+              if ! pnpm build:telegram:pages; then
+                echo "❌ Frontend build failed (Telegram pages)"
+                exit 1
+              fi
             else
               echo "Building with normal pages"
-              pnpm build:pages
+              if ! pnpm build:pages; then
+                echo "❌ Frontend build failed (Normal pages)"
+                exit 1
+              fi
             fi
+            
+            echo "✅ Frontend build completed"
             cd ..
-          fi
-
-          export debug_mode=${{ secrets.DEBUG_MODE }}
-          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
-          
-          cd worker/
-          # ✅ 修复核心：使用环境变量写入，避免 Shell 解析特殊字符
-          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
-          
-          pnpm install --no-frozen-lockfile
-
-          if [ -n "$use_mail_wasm_parser" ]; then
-            echo "Using mail-parser-wasm-worker"
-            pnpm add mail-parser-wasm-worker
-            git apply ../.github/config/mail-parser-wasm-worker.patch
-            echo "Applied mail-parser-wasm-worker patch"
-          fi
-
-          if [ "$debug_mode" = "true" ]; then
-            pnpm run deploy
           else
-            if pnpm run deploy >/dev/null 2>&1; then
-              echo "Deploy succeeded"
+            echo "ℹ️ Skipping frontend build (USE_WORKER_ASSETS not set)"
+          fi
+          
+          # 部署 Worker
+          echo "🚀 Starting worker deployment..."
+          cd worker/
+          
+          # 安全写入 wrangler.toml 配置文件
+          if [ -n "$WRANGLER_TOML_CONTENT" ]; then
+            echo "$WRANGLER_TOML_CONTENT" > wrangler.toml
+            echo "✅ wrangler.toml created"
+          else
+            echo "⚠️ Warning: BACKEND_TOML secret is empty"
+          fi
+          
+          # 安装依赖
+          echo "📦 Installing worker dependencies..."
+          if ! pnpm install --no-frozen-lockfile; then
+            echo "❌ Failed to install dependencies"
+            exit 1
+          fi
+          
+          # 应用 mail-parser-wasm-worker patch（如果需要）
+          if [ -n "$use_mail_wasm_parser" ]; then
+            echo "🔧 Configuring mail-parser-wasm-worker..."
+            
+            if ! pnpm add mail-parser-wasm-worker; then
+              echo "❌ Failed to add mail-parser-wasm-worker"
+              exit 1
+            fi
+            
+            # 检查 patch 是否已经应用
+            PATCH_FILE="../.github/config/mail-parser-wasm-worker.patch"
+            if [ -f "$PATCH_FILE" ]; then
+              # 测试 patch 是否可以应用（--reverse 检查是否已应用）
+              if git apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+                echo "ℹ️ Patch already applied, skipping..."
+              else
+                if git apply "$PATCH_FILE"; then
+                  echo "✅ Applied mail-parser-wasm-worker patch"
+                else
+                  echo "❌ Failed to apply patch"
+                  exit 1
+                fi
+              fi
+            else
+              echo "⚠️ Patch file not found: $PATCH_FILE"
+            fi
+          fi
+          
+          # 执行部署
+          echo "🌟 Deploying to Cloudflare Workers..."
+          DEPLOY_LOG="/tmp/worker_deploy_$(date +%s).log"
+          
+          if [ "$debug_mode" = "true" ]; then
+            echo "🔍 Debug mode enabled - showing full output"
+            if pnpm run deploy; then
+              echo "✅ Deployment successful"
             else
               code=$?
-              echo "Command failed with exit code $code"
+              echo "❌ Deployment failed with exit code $code"
+              exit "$code"
+            fi
+          else
+            echo "📝 Running deployment (output hidden, errors will be shown)..."
+            if pnpm run deploy >"$DEPLOY_LOG" 2>&1; then
+              echo "✅ Deployment successful"
+            else
+              code=$?
+              echo "❌ Deployment failed with exit code $code"
+              echo ""
+              echo "📋 Last 30 lines of error log:"
+              echo "----------------------------------------"
+              tail -n 30 "$DEPLOY_LOG" >&2
+              echo "----------------------------------------"
+              echo ""
+              echo "💡 Full log saved at: $DEPLOY_LOG"
+              echo "   You can download it from GitHub Actions artifacts"
               exit "$code"
             fi
           fi
-          echo "Deployed for tag ${{ github.ref_name }}"
+          
+          echo "🎉 Successfully deployed for tag: ${{ github.ref_name }}"
+          
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # ✅ 将 secret 映射到环境变量中
           WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
+
+      # 可选：保存部署日志作为 artifacts（仅在失败时）
+      - name: Upload deployment logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs-${{ github.run_id }}
+          path: /tmp/worker_deploy_*.log
+          retention-days: 7
+          if-no-files-found: ignore
